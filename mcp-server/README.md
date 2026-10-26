@@ -1,0 +1,248 @@
+# claude-watch-video-mcp
+
+> **MCP server wrapper for the [watch-video skill](https://github.com/MarcinSufa/claude-watch-video).** Exposes the full pipeline (download → frames → transcribe → dedup → report) and the read tools (transcript, report, highlights) as MCP tools in Claude Desktop, Codex CLI, Cursor, Continue.dev, Cline, Windsurf, Zed, VS Code Copilot Chat, and any other MCP-speaking host.
+
+The CLI scripts in [`../scripts/`](../scripts/) remain the canonical implementation. This package is a thin async wrapper around them — no business logic duplication.
+
+---
+
+## v2.1.0 — polling pair is the supported path
+
+The synchronous `watch_video` tool from v2.0.x hung on Claude Desktop / Windows (see [#1](https://github.com/MarcinSufa/claude-watch-video/issues/1)). Since v2.5.0 it runs through the same log-file-backed runner as the polling pair, so the piping deadlock is gone, but it still holds one MCP tool call open for the whole pipeline and a host that penalizes long calls can stall on that. The polling pair remains the supported path:
+
+- **`watch_video_start(input_ref, workdir=..., dedup=False, ...)`** → returns instantly with a `job_id`
+- **`watch_video_status(job_id)`** → poll every few seconds. State transitions from `running` → `done` / `failed`. Includes a `last_event` field showing the current pipeline step.
+
+When `state == "done"`, follow up with `read_transcript`, `read_report`, `pick_highlights`, etc. against the workdir from the status response.
+
+### Performance expectations (Windows + Claude Desktop)
+
+| Scenario | Time |
+|---|---|
+| Cold pipeline, captions available | ~2-3 min |
+| Cold pipeline, no captions (local Whisper fallback) | ~3-5 min for short videos |
+| Warm cache hit | < 1 second |
+
+The bulk of the cold time is Windows Defender scanning the orchestrator subprocess on first spawn. On Linux/macOS the same workload runs in ~3-15s. v2.1.1 will move the pipeline in-process to eliminate the outer subprocess + Defender scan.
+
+For CI, batch processing, or when you want streaming progress, the **CLI is still the fastest path** — it bypasses MCP entirely and runs in ~3-15s cold on Windows.
+
+---
+
+## Tools exposed
+
+| Tool | What it does | When to use |
+|---|---|---|
+| **`watch_video_start(input_ref, ...)`** | Start the pipeline as a background job. Returns `{job_id, state: "running", ...}` instantly. Takes `attachment_id=<id>` to name one video on a Jira issue holding several; without it such a run fails with an `ambiguous` block listing the candidates. Takes `frames=<n>` to set the frame budget, which is the knob to reach for when a silent recording skips dedup. Also takes the CLI's `dedup` (off by default, like `--dedup`), `ocr`, `whisper`, `lang`, `model`, `resolution`, `no_audio`, `start`/`end` and `highlights_prompt` (headless runs only; needs an Anthropic key). | The primary entry point. |
+| **`watch_video_status(job_id)`** | Poll job state. Returns `running` (with `last_event` + `elapsed_seconds`), `done` (with `meta` JSON), `failed` (with `error` text), or `stale` — the server process that owned the job is gone, so the status file can never advance. | Call every few seconds after `watch_video_start`. `running`, and only `running`, means keep polling. |
+| `watch_video(input_ref, ...)` | Synchronous one-shot pipeline call. No longer piped (v2.5.0), but holds one tool call open for the whole run. | Use the start/status pair instead unless you actually want to block. |
+| `read_transcript(workdir)` | Returns `transcript.md` content. When the pipeline ran with `--whisper deepgram`, each paragraph is prefixed with a speaker tag (`**S0** (_00:15_) ...`). | When you want just the narration. |
+| `read_report(workdir, fmt)` | Returns `report.md` / `report.html` / path to `report.docx`. | When you want the full evidence bundle. |
+| `pick_highlights(workdir, prompt, ...)` | LLM-driven moment selection. Six providers: Anthropic (default), OpenAI, Groq, DeepSeek, Gemini, openai-compat (generic). Default model: claude-haiku-4-5. | When you want "give me only the X parts." |
+| `read_highlights(workdir)` | Returns `highlights.json`. | After `pick_highlights` ran. |
+| `post_to_jira(workdir, confirm=...)` | Posts the report to the source Jira issue. **`confirm=False` runs in dry-run; `confirm=True` writes.** | Bug-triage workflows. |
+| `fetch_jira_attachment(jira_key, mime_prefix=...)` | Downloads non-video attachments (images, PDFs, ...) from a Jira issue and returns their paths. Writes files to disk under the tmp root (`outdir` outside it is rejected); writes nothing to Jira, so no `confirm`. | When the agent needs to look at screenshots on a ticket but its sandbox blocks the authenticated HTTPS call. |
+
+Plus one MCP **resource**: `workdir://<path>/meta.json` — read-only access to the workdir's metadata, for hosts that prefer the resource-browser pattern.
+
+### Agent guidance for the polling pair
+
+(Moved here from SKILL.md, which now covers the Claude Code CLI path only.)
+
+```
+1. Call mcp__watch-video__watch_video_start(input_ref=<URL>, ...)
+   → returns immediately with {"job_id": "<workdir-path>", "state": "running", ...}
+
+2. Loop: call mcp__watch-video__watch_video_status(job_id=<workdir-path>)
+   → wait ~3 seconds between polls
+   → break when "state" is "done", "failed", "stale" or "unknown"
+   → typical completion: 5-30 seconds for short YouTube clips with captions
+   → frames land in <workdir>/frames/ within ~10 s of start; for a silent
+     screen recording, read them with the host's image-read tool as soon as
+     watch_video_status shows the "frames" step complete, instead of
+     waiting for OCR or the report
+
+3. When state is "done":
+   - status["meta"] contains the full meta.json (workdir, transcript info,
+     frame counts, `warnings` -- read them, a skipped step is reported there)
+   - The workdir is also at status["workdir"]
+   - read_transcript(workdir=...) / read_report(workdir=..., fmt="md")
+   - pick_highlights(workdir=..., prompt="...") for LLM-driven moments (paid key)
+   - post_to_jira(workdir=..., confirm=True) to post (with user approval)
+```
+
+- **Jira issues carrying more than one video:** pass `attachment_id=<id>` to `watch_video_start` (or `watch_video`, which reports the same candidates in its error). Without it the job ends as `state: "failed"` with an `ambiguous` block listing every candidate (`id`, `filename`, `size_bytes`, `created`, `author`) and nothing is downloaded. Show that list, ask which video, then start again with its id. Each id gets its own workdir, so two videos from one ticket never share artifacts.
+- **Polling cadence:** start with 1-second intervals for the first few seconds (captions-eligible content often completes in <5 s), then back off to 3-5 second intervals. Most short clips complete in <10 seconds total; longer videos with local Whisper can take 30-120 seconds. A running state for 2-3 minutes on a short clip with `ocr=True` is normal on Windows (cold-start cost); past that, something is genuinely wrong -- surface this to the user.
+- **Why two tools instead of one blocking call:** the `watch_video` tool blocks the host for a single tool call that can run minutes, which some hosts (Claude Desktop on Windows among them) penalize. With the polling pair every tool call returns in <100 ms, and each poll shows the user the work is alive.
+
+---
+
+## Safety contract for `post_to_jira`
+
+This wrapper preserves the "no unsolicited Jira writes" invariant from the CLI:
+
+```text
+post_to_jira(workdir, confirm=False)   →   dry-run preview only, nothing written
+post_to_jira(workdir, confirm=True)    →   real post (after the HOST has asked the user)
+```
+
+MCP hosts MUST surface the planned action to the user and obtain authorization **before** setting `confirm=True`. Treat `confirm=True` as a privileged action.
+
+---
+
+## Install
+
+### From the repo (recommended while in beta)
+
+```bash
+git clone https://github.com/MarcinSufa/claude-watch-video
+cd claude-watch-video/mcp-server
+pip install -e .
+
+# Optionally install everything the underlying CLI needs:
+pip install -e ".[full]"
+
+# Developing? Add the test extra and run the unit tests:
+pip install -e ".[full,test]"
+python3 -m pytest -q
+```
+
+Dependency pins: `mcp>=1,<2` (mcp 2.x renamed FastMCP, so `server.py` cannot import against it) and, in `[full]`, `av<19` (PyAV 19 dropped the `metadata_errors` argument faster-whisper 1.2.x passes, which breaks every local transcription).
+
+After install, the `claude-watch-video-mcp` command is on your PATH.
+
+### Underlying CLI prerequisites
+
+The MCP server delegates to [`../scripts/watch_video.py`](../scripts/watch_video.py), which needs:
+
+| Required | For |
+|---|---|
+| `ffmpeg` + `ffprobe` | frame extraction, audio extraction, probing |
+| `faster-whisper` | local Whisper transcription (the default fallback) |
+
+Optional, unlocks features:
+
+| Optional | Unlocks |
+|---|---|
+| `yt-dlp` | URL input mode |
+| `Pillow` + `imagehash` | smart dedup (silent videos skip dedup: no transcript means no frame protection, see references/ocr-dedup.md) |
+| `pytesseract` + Tesseract binary | OCR on frames |
+| `anthropic` / `openai` Python SDK | LLM highlights |
+| `python-docx` | `report.docx` (gracefully skipped if missing) |
+| Atlassian API token at `~/.atlassian-token/credentials.json` | Jira fetch + post |
+
+See the main [README](../README.md#prerequisites-any-path) for install commands per platform.
+
+---
+
+## Configure your MCP host
+
+### Claude Desktop
+
+Edit `~/.claude.json` (or the platform-equivalent `claude_desktop_config.json`):
+
+```json
+{
+  "mcpServers": {
+    "watch-video": {
+      "command": "claude-watch-video-mcp"
+    }
+  }
+}
+```
+
+Or, without installing the package, point at the script directly:
+
+```json
+{
+  "mcpServers": {
+    "watch-video": {
+      "command": "python3",
+      "args": ["/absolute/path/to/claude-watch-video/mcp-server/server.py"]
+    }
+  }
+}
+```
+
+Restart Claude Desktop. The tools should appear in the tool picker.
+
+### Codex CLI
+
+```bash
+codex mcp add watch-video --command claude-watch-video-mcp
+```
+
+Or edit `~/.codex/config.toml`:
+
+```toml
+[mcp_servers.watch-video]
+command = "claude-watch-video-mcp"
+```
+
+### Cursor / Continue.dev / Cline / Windsurf / Zed / VS Code Copilot Chat
+
+Each host has its own MCP-server registration UI; all share the same shape: a `command` and optional `args`. Point them at `claude-watch-video-mcp` (or the absolute path to `server.py`) and they pick up the tools automatically.
+
+---
+
+## Pointing at a non-default scripts directory
+
+If you've installed the MCP server from PyPI but the CLI scripts live elsewhere on disk, set:
+
+```bash
+export WATCH_VIDEO_SCRIPTS_DIR=/path/to/claude-watch-video/scripts
+```
+
+The server resolves the scripts dir at startup via this env var, falling back to `<server-dir>/../scripts/` if unset.
+
+---
+
+## Example session
+
+```text
+USER: Watch https://www.youtube.com/watch?v=O664gH_szoY and tell me what's new.
+
+HOST → MCP: watch_video(input_ref="https://www.youtube.com/watch?v=O664gH_szoY")
+MCP → HOST: { "workdir": "/tmp/watch-O664gH_szoY", "elapsed_seconds": 3.82,
+             "transcript": { "provider": "captions", "segments": 19 }, ... }
+
+HOST → MCP: pick_highlights(workdir="/tmp/watch-O664gH_szoY",
+                            prompt="what is new in this Claude release")
+MCP → HOST: { "highlights": [
+    { "timestamp": "00:08", "reason": "..." },
+    ...
+] }
+
+HOST (to user): Here are the 5 most relevant moments from the video...
+```
+
+For a Jira flow:
+
+```text
+USER: Triage PROJ-1234 -- watch the attached video and identify the bug.
+
+HOST → MCP: watch_video(input_ref="PROJ-1234", dedup=True, ocr=True)
+MCP → HOST: { "workdir": "/tmp/watch-proj-1234", ... }
+
+HOST → MCP: pick_highlights(workdir="...", prompt="identify the bug and the moment it occurs")
+MCP → HOST: { "highlights": [...] }
+
+HOST (to user): Here is the bug analysis. Would you like me to post the
+                report back to PROJ-1234?
+USER: Yes, post it.
+
+HOST → MCP: post_to_jira(workdir="/tmp/watch-proj-1234", confirm=True)
+MCP → HOST: { "issue_key": "PROJ-1234", "comment_id": "10247", ... }
+```
+
+---
+
+## Versioning
+
+The MCP server's version (`v2.5.2`) tracks the parent repo; `.claude-plugin/plugin.json` carries the same number. The CLI scripts in `../scripts/` are the canonical artifact; this package version-locks to whichever scripts are present at install time. Pinning to a specific repo tag (`git checkout v2.5.2` before `pip install -e .`) ensures the script API matches what the server expects.
+
+---
+
+## License
+
+MIT. See [`../LICENSE`](../LICENSE).

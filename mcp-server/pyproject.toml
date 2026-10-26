@@ -1,0 +1,80 @@
+[project]
+name = "claude-watch-video-mcp"
+version = "2.5.2"
+description = "MCP server wrapper for the watch-video skill. Exposes watch_video_start + watch_video_status (non-blocking polling pair, v2.1.0+) plus the pipeline's read tools (transcript, report, highlights) and an opt-in Jira-posting tool to MCP hosts (Claude Desktop, Codex CLI, Cursor, Continue.dev, Cline, Windsurf, Zed, VS Code Copilot Chat)."
+readme = "README.md"
+authors = [
+    { name = "Marcin Sufa", email = "sufa.marcin@gmail.com" },
+]
+license = { text = "MIT" }
+requires-python = ">=3.10"
+keywords = ["mcp", "claude", "video", "transcription", "whisper", "ffmpeg", "jira"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+dependencies = [
+    # Required: MCP server framework. mcp 2.x renamed FastMCP (no
+    # `mcp.server.fastmcp`), so the server cannot import against it.
+    "mcp>=1,<2",
+]
+
+[project.optional-dependencies]
+# These deps are needed by the underlying CLI scripts, not the MCP server
+# itself. We list them here for convenience (`pip install '.[full]'` gives
+# you a fully-functional install).
+full = [
+    "yt-dlp>=2024.1.0",
+    "faster-whisper>=1.0.0",
+    # faster-whisper 1.2.x passes `metadata_errors=` to av.open(); PyAV 19
+    # dropped that argument and every local transcription dies with a
+    # TypeError. av 16-18 accept it.
+    "av<19",
+    "Pillow>=10.0",
+    "imagehash>=4.3.0",
+    "pytesseract>=0.3.10",
+    "python-docx>=1.0.0",
+    "anthropic>=0.18.0",
+    "openai>=1.0.0",
+]
+# Test runner deps: `pip install -e '.[full,test]'` then `python3 -m pytest`.
+# The async tests need pytest-asyncio; the dedup tests build frames with Pillow.
+test = [
+    "pytest>=7",
+    "pytest-asyncio>=0.21",
+    "Pillow>=10.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/MarcinSufa/claude-watch-video"
+Repository = "https://github.com/MarcinSufa/claude-watch-video"
+Issues = "https://github.com/MarcinSufa/claude-watch-video/issues"
+Documentation = "https://github.com/MarcinSufa/claude-watch-video/blob/main/mcp-server/README.md"
+
+[project.scripts]
+# After `pip install .`, this is the entry point hosts call via `command: claude-watch-video-mcp`.
+claude-watch-video-mcp = "server:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+only-include = ["server.py"]
+
+[tool.hatch.build.targets.sdist]
+include = ["server.py", "README.md"]
+
+[tool.pytest.ini_options]
+# Custom markers. Default test run skips `integration` because those tests
+# require network access, yt-dlp/ffmpeg/faster-whisper installed, and run
+# the real pipeline (slow + flaky against rate-limited remote videos).
+# Run them explicitly with: pytest -m integration
+markers = [
+    "integration: requires network + yt-dlp + ffmpeg + faster-whisper (slow, opt-in)",
+]
+addopts = "-m 'not integration'"
